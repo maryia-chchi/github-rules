@@ -1,0 +1,66 @@
+name: Validate Jira Ticket on PR Open
+
+on:
+  pull_request:
+    types: [opened, reopened]
+
+jobs:
+  validate-jira-ticket:
+    name: Jira ticket — exists and In Dev
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Extract Jira ticket ID from branch name
+        id: extract
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          TICKET=$(echo "$BRANCH" | grep -oE '[A-Z]+-[0-9]+' | head -1)
+
+          if [ -z "$TICKET" ]; then
+            echo "::error::No Jira ticket ID found in branch name '$BRANCH'. Expected format: PROJ-123 anywhere in the branch name."
+            exit 1
+          fi
+
+          echo "ticket=$TICKET" >> $GITHUB_OUTPUT
+          echo "Found ticket: $TICKET"
+
+      - name: Check Jira ticket exists and is In Dev
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          TICKET="${{ steps.extract.outputs.ticket }}"
+
+          RESPONSE=$(curl -s \
+            --write-out "\n%{http_code}" \
+            --user "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            --header "Accept: application/json" \
+            "$JIRA_BASE_URL/rest/api/3/issue/$TICKET?fields=status,summary")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" = "404" ]; then
+            echo "::error::Jira ticket $TICKET does not exist."
+            exit 1
+          fi
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Failed to reach Jira API. HTTP status: $HTTP_CODE. Check JIRA_BASE_URL, JIRA_EMAIL and JIRA_API_TOKEN secrets."
+            exit 1
+          fi
+
+          STATUS=$(echo "$BODY" | jq -r '.fields.status.name')
+          SUMMARY=$(echo "$BODY" | jq -r '.fields.summary')
+
+          echo "Ticket:  $TICKET"
+          echo "Summary: $SUMMARY"
+          echo "Status:  $STATUS"
+
+          if [ "$STATUS" != "In Dev" ]; then
+            echo "::error::$TICKET is in status '$STATUS'. Only tickets with status 'In Dev' can be opened as a PR."
+            exit 1
+          fi
+
+          echo "OK: $TICKET is In Dev."
