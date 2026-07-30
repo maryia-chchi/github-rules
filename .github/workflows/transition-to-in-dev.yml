@@ -62,7 +62,7 @@ jobs:
           echo "Summary: $SUMMARY"
           echo "Status:  $STATUS"
 
-          if [ "$STATUS" != "Ready for Dev" ]; then
+          if [ "$STATUS" != "Ready For Dev" ]; then
             echo "Ticket is already in '$STATUS'. Skipping transition."
             exit 0
           fi
