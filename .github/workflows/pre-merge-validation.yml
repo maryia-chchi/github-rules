@@ -1,0 +1,121 @@
+name: Pre-merge Validation
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  pre-merge-validation:
+    name: Jira — pre-merge checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Extract Jira ticket ID
+        id: extract
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          TICKET=$(echo "$PR_TITLE" | grep -oE '[A-Z]+-[0-9]+' | head -1)
+
+          if [ -z "$TICKET" ]; then
+            echo "::error::No Jira ticket ID found in PR title '$PR_TITLE'. Add the ticket ID to the PR title, e.g. 'PROJ-123 My feature description'."
+            exit 1
+          fi
+
+          echo "ticket=$TICKET" >> $GITHUB_OUTPUT
+          echo "Found ticket: $TICKET"
+
+      - name: Fetch ticket details
+        id: ticket
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          TICKET="${{ steps.extract.outputs.ticket }}"
+
+          RESPONSE=$(curl -s \
+            --write-out "\n%{http_code}" \
+            --user "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            --header "Accept: application/json" \
+            "$JIRA_BASE_URL/rest/api/3/issue/$TICKET?fields=status,summary,issuetype,fixVersions,customfield_11429")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" = "404" ]; then
+            echo "::error::Jira ticket $TICKET not found."
+            exit 1
+          fi
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Jira API returned HTTP $HTTP_CODE. Check secrets."
+            exit 1
+          fi
+
+          STATUS=$(echo "$BODY" | jq -r '.fields.status.name')
+          ISSUE_TYPE=$(echo "$BODY" | jq -r '.fields.issuetype.name')
+          SUMMARY=$(echo "$BODY" | jq -r '.fields.summary')
+          PLATFORM=$(echo "$BODY" | jq -r '.fields.customfield_11429.value // ""')
+
+          echo "Ticket:   $TICKET"
+          echo "Summary:  $SUMMARY"
+          echo "Type:     $ISSUE_TYPE"
+          echo "Status:   $STATUS"
+          echo "Platform: $PLATFORM"
+
+          NEEDS_CHECKS=false
+
+          if [ "$ISSUE_TYPE" = "User Story" ]; then
+            NEEDS_CHECKS=true
+          elif [[ "$ISSUE_TYPE" == "Bug" || "$ISSUE_TYPE" == "Prod Bug" ]]; then
+            if [[ "$PLATFORM" == "Android" || "$PLATFORM" == "iOS" ]]; then
+              NEEDS_CHECKS=true
+            else
+              echo "::error::$TICKET is a '$ISSUE_TYPE' with Platform '$PLATFORM'. Only Bug and Prod Bug tickets with Platform = Android or iOS are allowed in PRs. Use a User Story, or a Bug/Prod Bug targeting Android or iOS."
+              exit 1
+            fi
+          else
+            echo "::error::$TICKET is a '$ISSUE_TYPE'. PRs must be linked to a User Story, or a Bug/Prod Bug with Platform = Android or iOS."
+            exit 1
+          fi
+
+          echo "$BODY" > /tmp/jira_ticket.json
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Validate Fix Version
+        if: steps.ticket.outputs.skip != 'true'
+        run: |
+          TICKET="${{ steps.extract.outputs.ticket }}"
+          BODY=$(cat /tmp/jira_ticket.json)
+
+          FIX_VERSIONS_COUNT=$(echo "$BODY" | jq '.fields.fixVersions | length')
+          UNRELEASED_COUNT=$(echo "$BODY" | jq '[.fields.fixVersions[] | select(.released == false)] | length')
+
+          echo "Fix Versions set:    $FIX_VERSIONS_COUNT"
+          echo "Unreleased versions: $UNRELEASED_COUNT"
+
+          if [ "$FIX_VERSIONS_COUNT" -eq 0 ]; then
+            echo "::error::$TICKET has no Fix Version set. Add an active Fix Version in Jira before merging."
+            exit 1
+          fi
+
+          if [ "$UNRELEASED_COUNT" -eq 0 ]; then
+            echo "::error::$TICKET has no active Fix Version — all assigned versions are already released."
+            exit 1
+          fi
+
+          echo "Fix Version OK."
+
+      - name: Validate status is In Review
+        if: steps.ticket.outputs.skip != 'true'
+        run: |
+          TICKET="${{ steps.extract.outputs.ticket }}"
+          STATUS="${{ steps.ticket.outputs.status }}"
+
+          if [ "$STATUS" != "In Review" ]; then
+            echo "::error::$TICKET is in '$STATUS'. Expected 'In Review' — PM and Designer must approve in Jira before merge."
+            exit 1
+          fi
+
+          echo "Status OK: In Review."
+
