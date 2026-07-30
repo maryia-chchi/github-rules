@@ -2,12 +2,13 @@ name: Pre-merge Validation
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, edited]
 
 jobs:
   pre-merge-validation:
     name: Jira — pre-merge checks
     runs-on: ubuntu-latest
+    if: github.event.action != 'edited' || github.event.changes.title != null
 
     steps:
       - name: Extract Jira ticket ID
