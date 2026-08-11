@@ -1,1 +1,1 @@
-print ("first check d")
+print ("first check")
