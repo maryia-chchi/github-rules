@@ -2,12 +2,13 @@ name: Pre-merge Validation
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, edited]
 
 jobs:
   pre-merge-validation:
     name: Jira — pre-merge checks
     runs-on: ubuntu-latest
+    if: github.event.action != 'edited' || github.event.changes.title != null
 
     steps:
       - name: Extract Jira ticket ID
@@ -81,6 +82,7 @@ jobs:
 
           echo "$BODY" > /tmp/jira_ticket.json
           echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "issue_type=$ISSUE_TYPE" >> $GITHUB_OUTPUT
 
       - name: Validate Fix Version
         if: steps.ticket.outputs.skip != 'true'
@@ -106,16 +108,23 @@ jobs:
 
           echo "Fix Version OK."
 
-      - name: Validate status is In Review
+      - name: Validate status
         if: steps.ticket.outputs.skip != 'true'
         run: |
           TICKET="${{ steps.extract.outputs.ticket }}"
           STATUS="${{ steps.ticket.outputs.status }}"
+          ISSUE_TYPE="${{ steps.ticket.outputs.issue_type }}"
 
-          if [ "$STATUS" != "In Review" ]; then
-            echo "::error::$TICKET is in '$STATUS'. Expected 'In Review' — PM and Designer must approve in Jira before merge."
+          if [ "$ISSUE_TYPE" = "User Story" ]; then
+            EXPECTED_STATUS="In Review"
+          else
+            EXPECTED_STATUS="IN QA"
+          fi
+
+          if [ "$STATUS" != "$EXPECTED_STATUS" ]; then
+            echo "::error::$TICKET is in '$STATUS'. Expected '$EXPECTED_STATUS' for type '$ISSUE_TYPE'."
             exit 1
           fi
 
-          echo "Status OK: In Review."
+          echo "Status OK: $STATUS."
 
