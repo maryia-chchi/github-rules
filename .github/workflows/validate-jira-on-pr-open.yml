@@ -2,29 +2,37 @@ name: Validate Jira Ticket on PR Open
 
 on:
   pull_request:
-    types: [opened, reopened]
+    types: [opened, reopened, edited]
 
 jobs:
   validate-jira-ticket:
-    name: Jira ticket — exists and In Dev
+    name: Jira ticket — exists and valid type
     runs-on: ubuntu-latest
+    if: github.event.action != 'edited' || github.event.changes.title != null
 
     steps:
-      - name: Extract Jira ticket ID from branch name
+      - name: Validate PR title format and extract ticket ID
         id: extract
         run: |
-          BRANCH="${{ github.head_ref }}"
-          TICKET=$(echo "$BRANCH" | grep -oE '[A-Z]+-[0-9]+' | head -1)
+          HEAD_REF="${{ github.head_ref }}"
+          if [[ "$HEAD_REF" == release/* ]]; then
+            echo "Back-merge from release branch. All checks skipped."
+            exit 0
+          fi
 
-          if [ -z "$TICKET" ]; then
-            echo "::error::No Jira ticket ID found in branch name '$BRANCH'. Expected format: PROJ-123 anywhere in the branch name."
+          PR_TITLE="${{ github.event.pull_request.title }}"
+
+          if ! echo "$PR_TITLE" | grep -qE '^\[[A-Z]+-[0-9]+\].+'; then
+            echo "::error::PR title '$PR_TITLE' does not match required format: [PROJ-123] Summary. Add a Jira ticket ID in square brackets at the start of the title."
             exit 1
           fi
 
+          TICKET=$(echo "$PR_TITLE" | grep -oE '\[[A-Z]+-[0-9]+\]' | head -1 | tr -d '[]')
           echo "ticket=$TICKET" >> $GITHUB_OUTPUT
           echo "Found ticket: $TICKET"
 
-      - name: Check Jira ticket exists and is In Dev
+      - name: Fetch ticket and validate type
+        if: steps.extract.outputs.ticket != ''
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
@@ -32,35 +40,68 @@ jobs:
         run: |
           TICKET="${{ steps.extract.outputs.ticket }}"
 
-          RESPONSE=$(curl -s \
-            --write-out "\n%{http_code}" \
-            --user "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-            --header "Accept: application/json" \
-            "$JIRA_BASE_URL/rest/api/3/issue/$TICKET?fields=status,summary")
+          for ATTEMPT in 1 2 3; do
+            RESPONSE=$(curl -s \
+              --write-out "\n%{http_code}" \
+              --user "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+              --header "Accept: application/json" \
+              "$JIRA_BASE_URL/rest/api/3/issue/$TICKET?fields=summary,issuetype")
 
-          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+
+            if [[ "$HTTP_CODE" -ge 500 ]]; then
+              echo "Attempt $ATTEMPT: Jira returned HTTP $HTTP_CODE."
+              if [ "$ATTEMPT" -lt 3 ]; then
+                echo "Retrying in 5 seconds..."
+                sleep 5
+              fi
+              continue
+            fi
+
+            break
+          done
+
+          if [[ "$HTTP_CODE" -ge 500 ]]; then
+            echo "::error::Jira API is unavailable (HTTP $HTTP_CODE after 3 attempts). Try again later."
+            exit 1
+          fi
+
+          if [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+            echo "::error::Jira authentication failed (HTTP $HTTP_CODE). Check JIRA_EMAIL and JIRA_API_TOKEN secrets."
+            exit 1
+          fi
 
           if [ "$HTTP_CODE" = "404" ]; then
-            echo "::error::Jira ticket $TICKET does not exist."
+            ERROR_MSG=$(echo "$BODY" | jq -r '.errorMessages[0] // ""')
+            if echo "$ERROR_MSG" | grep -qi "does not exist\|not found"; then
+              echo "::error::Jira ticket $TICKET does not exist. Check the ticket ID in the PR title."
+            else
+              echo "::error::Could not access Jira ticket $TICKET — this may be an authentication or permission issue. Check JIRA_EMAIL and JIRA_API_TOKEN secrets. Jira response: $ERROR_MSG"
+            fi
             exit 1
           fi
 
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::Failed to reach Jira API. HTTP status: $HTTP_CODE. Check JIRA_BASE_URL, JIRA_EMAIL and JIRA_API_TOKEN secrets."
+            echo "::error::Jira API returned unexpected HTTP $HTTP_CODE. Check JIRA_BASE_URL secret."
             exit 1
           fi
 
-          STATUS=$(echo "$BODY" | jq -r '.fields.status.name')
+          ISSUE_TYPE=$(echo "$BODY" | jq -r '.fields.issuetype.name')
           SUMMARY=$(echo "$BODY" | jq -r '.fields.summary')
 
           echo "Ticket:  $TICKET"
           echo "Summary: $SUMMARY"
-          echo "Status:  $STATUS"
+          echo "Type:    $ISSUE_TYPE"
 
-          if [ "$STATUS" != "In Dev" ]; then
-            echo "::error::$TICKET is in status '$STATUS'. Only tickets with status 'In Dev' can be opened as a PR."
+          if [[ "$ISSUE_TYPE" == "Sub-task" || "$ISSUE_TYPE" == "Sub-bug" ]]; then
+            echo "::error::$TICKET is a '$ISSUE_TYPE'. Do not open PRs for sub-tickets — use the parent ticket instead."
             exit 1
           fi
 
-          echo "OK: $TICKET is In Dev."
+          if [ "$ISSUE_TYPE" = "Epic" ]; then
+            echo "::error::$TICKET is an Epic. Do not open PRs directly for Epics — use a story or task ticket instead."
+            exit 1
+          fi
+
+          echo "OK: $TICKET ($ISSUE_TYPE) is valid."
